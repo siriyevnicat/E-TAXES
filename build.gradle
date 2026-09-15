@@ -1,0 +1,147 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.16'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'az.gmb'
+version = '7.1.13-full-transfer-backup'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+
+springBoot {
+    mainClass = 'az.gmb.taxdata.TaxDataApplication'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.security:spring-security-crypto'
+    implementation 'org.apache.poi:poi-ooxml:5.4.1'
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+    implementation 'com.microsoft.playwright:playwright:1.57.0'
+
+    runtimeOnly 'org.postgresql:postgresql'
+    runtimeOnly 'com.h2database:h2'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+
+// TaxData local companion agent: same classes/dependencies, separate executable Spring Boot JAR.
+tasks.register('agentBootJar', org.springframework.boot.gradle.tasks.bundling.BootJar) {
+    group = 'build'
+    description = 'Builds the local TaxData Agent executable JAR (no browser binaries included).'
+    dependsOn tasks.named('classes')
+    archiveFileName = 'taxdata-agent.jar'
+    mainClass = 'taxdata.agent.AgentApplication'
+    classpath = sourceSets.main.runtimeClasspath
+
+    // A manually-created BootJar does not inherit every convention of the standard
+    // bootJar task. Configure the Java metadata explicitly and verify the runnable
+    // agent entry point after packaging.
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    resolvedArtifacts(configurations.runtimeClasspath.incoming.artifacts.resolvedArtifacts)
+    manifest { attributes 'Implementation-Version': project.version }
+
+    doLast {
+        def agentJar = archiveFile.get().asFile
+        if (!agentJar.isFile() || agentJar.length() <= 100000L) {
+            throw new GradleException('TaxData Local Agent JAR yaradılmadı və ya natamamdır.')
+        }
+        def zip = new java.util.zip.ZipFile(agentJar)
+        try {
+            def mainEntry = zip.getEntry('BOOT-INF/classes/taxdata/agent/AgentApplication.class')
+            if (mainEntry == null || mainEntry.size <= 0) {
+                throw new GradleException('TaxData Local Agent JAR işlək deyil: AgentApplication.class daxil edilməyib.')
+            }
+            println "[TaxData] Agent artifact verified: ${agentJar.absolutePath}"
+        } finally {
+            zip.close()
+        }
+    }
+}
+
+
+// Local development guarantee:
+// `bootRun` serves /agent/bootstrap too, therefore the companion agent artifact
+// must exist before the localhost:8080 server is considered started.
+tasks.register('verifyLocalAgentArtifact') {
+    group = 'verification'
+    description = 'Builds and verifies taxdata-agent.jar before local bootRun.'
+    dependsOn tasks.named('agentBootJar')
+    doLast {
+        def f = layout.buildDirectory.file('libs/taxdata-agent.jar').get().asFile
+        if (!f.isFile() || f.length() <= 100000L) {
+            throw new GradleException('TaxData Local Agent artefaktı hazırlanmadı: build/libs/taxdata-agent.jar')
+        }
+        println "[TaxData] Local Agent artifact ready: ${f.absolutePath} (${f.length()} bytes)"
+    }
+}
+
+tasks.named('bootRun') {
+    dependsOn tasks.named('verifyLocalAgentArtifact')
+    doFirst {
+        def f = layout.buildDirectory.file('libs/taxdata-agent.jar').get().asFile
+        if (!f.isFile() || f.length() <= 100000L) {
+            throw new GradleException('localhost:8080 başlamadı: TaxData Local Agent artefaktı hazır deyil.')
+        }
+        systemProperty 'taxdata.agent.jar', f.absolutePath
+        println '[TaxData] localhost:8080 agent distribution enabled.'
+    }
+}
+
+tasks.named('bootJar') {
+    // The production server is self-contained even if only taxdata-server.jar is deployed.
+    // Docker also copies taxdata-agent.jar to /app/agent as a second independent source.
+    dependsOn tasks.named('agentBootJar')
+    archiveFileName = 'taxdata-server.jar'
+    mainClass = 'az.gmb.taxdata.TaxDataApplication'
+
+    // Add the companion agent through BootJar's BOOT-INF copy spec. This is
+    // more robust than writing an absolute BOOT-INF path from the root copy spec
+    // and guarantees the resource lands at BOOT-INF/classes/agent-dist/.
+    bootInf {
+        into('classes/agent-dist') {
+            from(tasks.named('agentBootJar').flatMap { it.archiveFile })
+            rename { 'taxdata-agent.jar' }
+        }
+    }
+
+    // Never allow a production server JAR to be produced without the embedded agent.
+    // This converts the previous runtime HTTP 503 into a build-time failure.
+    doLast {
+        def serverJar = archiveFile.get().asFile
+        def zip = new java.util.zip.ZipFile(serverJar)
+        try {
+            def required = [
+                'BOOT-INF/classes/agent-dist/taxdata-agent.jar': 100000L,
+                'BOOT-INF/classes/agent/setup.cmd': 500L,
+                'BOOT-INF/classes/agent/setup.ps1': 1000L
+            ]
+            required.each { path, minSize ->
+                def entry = zip.getEntry(path)
+                if (entry == null || entry.size < minSize) {
+                    throw new GradleException("TaxData production build natamamdır: ${path} server JAR-a daxil edilməyib və ya ölçüsü düzgün deyil.")
+                }
+            }
+            println "[TaxData] Production artifact verified: embedded agent + setup resources are present."
+        } finally {
+            zip.close()
+        }
+    }
+}
