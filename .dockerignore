@@ -1,0 +1,11 @@
+.git
+.gradle
+build
+data
+*.zip
+.idea
+*.iml
+.env
+.env.local
+.env.server
+.env.production
